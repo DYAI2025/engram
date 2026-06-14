@@ -639,3 +639,84 @@ func TestCrossProjectGuard_SessionFallback_AllowsSameSessionProject(t *testing.T
 		t.Error("JudgeBySemantic: expected non-empty relSyncID for same-session-project pair")
 	}
 }
+
+// ─── Test 8: JudgeRelation uses session-fallback for project derivation ────────
+
+// TestJudgeRelation_UsesSessionFallback_ForProject verifies that JudgeRelation
+// derives the Project for the enqueued sync mutation via the session-fallback
+// (coalesce(obs.project, session.project)), not from observations.project alone.
+//
+// Scenario: project P is enrolled; a session exists in P; two observations are
+// created in that session with BLANK observations.project (project lives only on
+// the session). A pending relation is saved between them. Calling JudgeRelation
+// must enqueue a sync_mutations row whose payload.project is "P", not "".
+//
+// Without the fix, srcProject="" → enrollCheckProject="" → enrolled=0 → return nil
+// (no mutation row). After the fix, the session-fallback resolves srcProject="P",
+// enrollCheckProject="P", enrolled=1, and the mutation is written immediately.
+func TestJudgeRelation_UsesSessionFallback_ForProject(t *testing.T) {
+	s := newTestStore(t)
+
+	// Create a session with an explicit project and enroll it.
+	if err := s.CreateSession("ses-jr-sf", "proj-jr-sf", "/tmp/jr-sf"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.EnrollProject("proj-jr-sf"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+
+	// Create observations with BLANK observations.project — project lives only on
+	// the session. This simulates observations ingested before the project column
+	// was populated, which is the exact gap described in the CodeRabbit finding.
+	_, srcSyncID := addTestObsSession(t, s, "ses-jr-sf", "JR SF source obs", "decision", "", "project")
+	_, tgtSyncID := addTestObsSession(t, s, "ses-jr-sf", "JR SF target obs", "decision", "", "project")
+
+	// Save a pending relation (the precursor step before JudgeRelation).
+	relSyncID := newSyncID("rel-jr-sf")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: srcSyncID,
+		TargetID: tgtSyncID,
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	// Pre-condition: no mutation row yet (SaveRelation does not enqueue).
+	if n := countRelationSyncMutationsByKey(t, s, relSyncID); n != 0 {
+		t.Fatalf("precondition: expected 0 sync_mutations before JudgeRelation, got %d", n)
+	}
+
+	// Call JudgeRelation — this is the code path being fixed.
+	if _, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationRelated,
+		MarkedByActor: "test-actor",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("JudgeRelation: %v", err)
+	}
+
+	// Post-condition 1: a sync_mutations row must exist immediately after
+	// JudgeRelation (no waiting for startup backfill).
+	if n := countRelationSyncMutationsByKey(t, s, relSyncID); n != 1 {
+		t.Errorf("expected 1 sync_mutations row after JudgeRelation on enrolled project (session-fallback); got %d", n)
+	}
+
+	// Post-condition 2: the enqueued payload's project must be "proj-jr-sf",
+	// not "" — so cloud validation does not reject it.
+	var payloadProject string
+	if err := s.db.QueryRow(
+		`SELECT ifnull(json_extract(payload, '$.project'), '')
+		   FROM sync_mutations
+		  WHERE entity = ? AND entity_key = ? AND source = ?`,
+		SyncEntityRelation, relSyncID, SyncSourceLocal,
+	).Scan(&payloadProject); err != nil {
+		t.Fatalf("reading payload project from sync_mutations: %v", err)
+	}
+	if payloadProject == "" {
+		t.Errorf("JudgeRelation enqueued payload has empty project; session-fallback must populate it")
+	}
+	if payloadProject != "proj-jr-sf" {
+		t.Errorf("expected payload project %q, got %q", "proj-jr-sf", payloadProject)
+	}
+}

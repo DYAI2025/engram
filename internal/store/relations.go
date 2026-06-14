@@ -591,13 +591,22 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 	if err := s.withTx(func(tx *sql.Tx) error {
 		// ── Cross-project guard (Phase 2, REQ-003) ─────────────────────────
 		// Derive source and target project for enrollment checks and the guard.
-		// Missing observation → empty string (REQ-011 edge).
+		// Use the same session-fallback form as JudgeBySemantic so that enrolled
+		// projects whose observations have a blank project column (but whose session
+		// carries the project) are resolved correctly. Missing observation → empty
+		// string (REQ-011 edge) because the LEFT JOIN returns no row.
 		var srcProject, tgtProject string
 		_ = tx.QueryRow(
-			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, sourceID,
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, sourceID,
 		).Scan(&srcProject)
 		_ = tx.QueryRow(
-			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, targetID,
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, targetID,
 		).Scan(&tgtProject)
 
 		// Delegate to shared helper; reject cross-project pairs.
